@@ -34,11 +34,14 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import platform
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
+from kiro_crew import __version__, beacon
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
 from kiro_crew.metrics.recorder import MetricsRecorder
@@ -149,6 +152,23 @@ logger = logging.getLogger(__name__)
 
 _SERVICE_NAME = "kirocrew"
 _SCOPE = "kiro_crew"
+
+# ``platform.machine()`` spellings -> OTel semantic-convention ``host.arch``
+# values. Every environment attribute below is a CLOSED set: a spelling this
+# map does not know folds to :data:`_ATTR_OTHER` rather than passing through,
+# so an exotic platform cannot mint a label of its own.
+_ARCH_BY_MACHINE = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "i386": "x86",
+    "i686": "x86",
+}
+_KNOWN_OS_TYPES = frozenset({"linux", "darwin", "windows"})
+#: Fold target for any environment reading outside its known set. One shared
+#: bucket, so "unknown" stays a single bounded label per attribute.
+_ATTR_OTHER = "other"
 
 # Explicit histogram bucket boundaries (milliseconds), applied PER INSTRUMENT via
 # MeterProvider Views. OTEL's default boundaries top out at 10s, so anything
@@ -348,6 +368,19 @@ _ever_built = False
 # rather than stranding the check.
 _check_in_flight = False
 
+# One-shot install-id backfill state. ``_id_backfill_pending`` is True while a
+# LIVE recorder is serving whose resource lacks ``service.instance.id`` (fresh
+# install: the synchronous build path is read-only for the id). It makes the
+# consent worker due immediately and lets it rebuild WITHOUT a consent flip --
+# closing the gap where an already-enabled fresh install (config pre-enabled,
+# beacon disabled, e.g. a container image) would otherwise export id-less
+# metrics for the whole process lifetime. ``_id_backfill_attempted`` bounds it
+# to ONE attempt per process: without it, a host whose mint fails (unwritable
+# data dir) would tear down and rebuild the recorder every recheck window
+# forever. Both are written under ``_lock``.
+_id_backfill_pending = False
+_id_backfill_attempted = False
+
 # Env-var opt-in. ``KIROCREW_TELEMETRY`` lets a host turn
 # LOCAL metrics on (or force them off) without editing ~/.kiro/crew/config.json —
 # handy for CI, containers, and one-off debugging. Truthy => enable, falsy =>
@@ -393,16 +426,137 @@ def _default_metrics_dir() -> Path:
     return config_dir() / "metrics"
 
 
+def _resource_attributes() -> "dict[str, str | int]":
+    """Resource attributes for the MeterProvider.
+
+    A resource attribute becomes a LABEL on every series this process exports,
+    which cuts both ways: it is the only place fleet-level GROUP BYs can come
+    from, and any unbounded value here multiplies every instrument's series
+    count. So every attribute is a closed set or explicitly clamped, and every
+    probe fails soft -- a failed read omits the attribute rather than losing
+    telemetry or inventing a value.
+
+    ``service.instance.id`` is set EXPLICITLY to the persisted install id
+    rather than left to the SDK, whose default identifies a PROCESS: a fresh
+    UUID per restart starts a brand-new series set every time -- fast,
+    pure-cost growth on desktops, which restart constantly -- and it severs
+    "this install over time" across restarts. Machines must still be separable
+    (a fleet percentile is computed ACROSS series; identical labels would
+    collide every host into one series), which is why the id exists at all.
+    It is a random UUID persisted on disk, deliberately NOT derived from
+    hostname or username, which on a corporate desktop routinely embed the
+    employee's alias.
+
+    ``process.pid`` (OTel semconv) carries the PROCESS identity SEPARATELY:
+    one install runs several telemetry-enabled processes at once (the gateway
+    plus spawned agents/apps each build their own recorder -- the reason the
+    local exporter shards per PID), and with an install-scoped resource alone
+    their per-process gauges and cumulative counters would interleave into one
+    corrupted series at any OTLP backend. The pid makes each process its own
+    resource; the install id groups them back together for fleet questions
+    (distinct devices, per-install rollups). PID reuse across restarts reads
+    as an ordinary counter reset downstream. A LIVE build that could not read
+    the id arms a one-shot backfill (see ``_Build.needs_id_backfill``): the
+    consent worker mints it and rebuilds without waiting for a consent flip,
+    so even a pre-enabled fresh install carries its identity within roughly
+    one recheck scheduling. Residual, accepted: a host whose mint FAILS
+    (unwritable data dir) keeps exporting id-less metrics, and two such hosts
+    sharing a pid and environment would collide at a backend.
+
+    This function only ever READS the install id (``create=False``: one stat
+    + a 32-byte read, the same class as the config fingerprint check). It can
+    run inside the FIRST recorder build, which is synchronous on whatever
+    thread touched telemetry first -- the module docstring documents that this
+    can be the event loop -- and CREATING the id is mkdir + mkstemp + link.
+    The mint instead happens where a thread of our own is guaranteed: the
+    consent-worker rebuild (see ``_consent_worker``), and independently the
+    beacon's own daily send on any install that has not disabled it. Until
+    one of those runs, the attribute is simply absent; local shards stay
+    unambiguous regardless, because the exporter stamps per-process identity
+    on every line.
+
+    ``service.version`` is the release-clamped build version
+    (:func:`beacon.release`, the same clamp the beacon ships). Without it
+    nothing in a payload identifies the build that produced it, so
+    release-over-release comparison degenerates to comparing time ranges --
+    which a gradual rollout muddies, since both versions report into the same
+    buckets. With the label it is a GROUP BY. The clamp matters as much as the
+    field: a raw dev/nightly ``__version__`` carries a per-build stamp, so an
+    unclamped value would mint a new series set per build.
+
+    The environment attributes (``os.type``, ``host.arch``,
+    ``process.runtime.name``/``version``) follow the OTel semantic conventions
+    and are CLOSED sets: readings outside the known values fold to
+    :data:`_ATTR_OTHER`, and the runtime version is clamped to ``major.minor``
+    (the patch level adds cardinality without answering anything the minor
+    does not -- the beacon's rule). ``host.cpu.logical_count`` is what lets
+    ``kirocrew.process.cpu.seconds`` be normalized into a machine percentage
+    downstream: the core count exists only client-side, so it must travel
+    with the data.
+
+    Deliberately absent:
+
+      * the distribution channel. The beacon's data-minimization pass REMOVED
+        its channel field because channel sharply narrows the crowd a stable id
+        hides in (a nightly population is small by definition). Stamping it on
+        every metric payload would quietly undo that decision; re-adding it is
+        a consent-inventory question, not a code convenience.
+      * an install type (desktop / cli / remote-gateway). There is no reliable
+        detection today; a guessed label would be confidently wrong.
+    """
+    attrs: "dict[str, str | int]" = {"service.name": _SERVICE_NAME}
+    try:
+        # Process identity, SEPARATE from install identity: several
+        # telemetry-enabled processes run per install, and without a
+        # per-process resource their gauges/counters interleave into one
+        # corrupted series at any OTLP backend.
+        attrs["process.pid"] = int(os.getpid())
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("process.pid resource attr unavailable: %s", exc)
+    try:
+        attrs["service.version"] = beacon.release(__version__)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("service.version resource attr unavailable: %s", exc)
+    try:
+        os_type = platform.system().lower()
+        attrs["os.type"] = os_type if os_type in _KNOWN_OS_TYPES else _ATTR_OTHER
+        machine = platform.machine().lower()
+        attrs["host.arch"] = _ARCH_BY_MACHINE.get(machine, _ATTR_OTHER)
+        attrs["process.runtime.name"] = platform.python_implementation().lower()
+        attrs["process.runtime.version"] = (
+            f"{sys.version_info.major}.{sys.version_info.minor}"
+        )
+        cores = os.cpu_count()
+        if cores:
+            attrs["host.cpu.logical_count"] = int(cores)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("environment resource attrs unavailable: %s", exc)
+    try:
+        install_id = beacon.install_id(create=False)
+        if install_id:
+            attrs["service.instance.id"] = install_id
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("stable install id unavailable: %s", exc)
+    return attrs
+
+
 class _Build(NamedTuple):
     """What a build produced, for a caller to install under ``_lock``.
 
     Returned rather than assigned so the expensive part can run OFF the lock and
     off the event loop: only the install is a critical section.
+
+    ``needs_id_backfill`` is True when a LIVE build could not label its
+    resource with the persisted install id (fresh install: the build path is
+    read-only for the id). Installing such a build arms a one-shot backfill:
+    the consent worker mints the id and rebuilds, off-loop, without waiting
+    for a consent flip.
     """
 
     recorder: MetricsRecorder
     provider: Optional["_MeterProviderT"]
     consent: Optional[bool]
+    needs_id_backfill: bool = False
 
 
 def _build_recorder() -> _Build:
@@ -482,9 +636,10 @@ def _build_recorder() -> _Build:
                 started_readers.append(reader)
                 otlp_names.append(dest.name)
         otlp_active = bool(otlp_names)
+        resource_attrs = _resource_attributes()
         provider = MeterProvider(
             metric_readers=started_readers,
-            resource=Resource.create({"service.name": _SERVICE_NAME}),
+            resource=Resource.create(resource_attrs),
             # One View per instrument, from histogram_bounds() (the ms families
             # plus the non-ms ones). Deliberately NOT a catch-all
             # `instrument_type=Histogram` View: the OTEL SDK applies every
@@ -528,7 +683,12 @@ def _build_recorder() -> _Build:
             register_process_gauges(meter)
         except Exception:
             logger.warning("process gauges unavailable", exc_info=True)
-        return _Build(MetricsRecorder(meter), provider, consent)
+        return _Build(
+            MetricsRecorder(meter),
+            provider,
+            consent,
+            needs_id_backfill="service.instance.id" not in resource_attrs,
+        )
     except Exception as exc:
         logger.warning("telemetry init failed; metrics disabled: %s", exc)
         # Reap EVERY reader already started, not just the first: an egress
@@ -726,13 +886,17 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
 def _install_locked(built: _Build) -> None:
     """Publish a finished build. Call under ``_lock``."""
     global _recorder, _provider, _initialized, _built_consent, _consent_checked_at
-    global _ever_built
+    global _ever_built, _id_backfill_pending
     _recorder = built.recorder
     _provider = built.provider
     _built_consent = built.consent
     _initialized = True
     _consent_checked_at = time.monotonic()
     _ever_built = True
+    # Arms (or, after a successful backfill rebuild, clears) the one-shot
+    # install-id backfill. A build that read the id installs False here, so
+    # the flag's lifetime is exactly "a live recorder without an id exists".
+    _id_backfill_pending = built.needs_id_backfill
 
 
 def _consent_worker(generation: int) -> None:
@@ -745,7 +909,7 @@ def _consent_worker(generation: int) -> None:
     on the event loop by the route-latency middleware for every request.
     """
     global _consent_checked_at, _check_in_flight, _recorder, _initialized
-    global _built_consent
+    global _built_consent, _id_backfill_attempted
     try:
         try:
             consent: Optional[bool] = _consent_enabled(KiroCrewConfig.load().telemetry)
@@ -768,16 +932,40 @@ def _consent_worker(generation: int) -> None:
             # Stamp even when the read failed, so an unreadable config cannot turn
             # every metric call into a fresh read.
             _consent_checked_at = time.monotonic()
-            if consent is None or consent == _built_consent:
+            # One-shot backfill: a live id-less recorder is rebuilt even though
+            # consent did not move, so a pre-enabled fresh install (container
+            # image with the beacon disabled) acquires its identity instead of
+            # exporting id-less metrics for the whole process lifetime.
+            backfill = (
+                _id_backfill_pending
+                and not _id_backfill_attempted
+                and consent is True
+            )
+            if (consent is None or consent == _built_consent) and not backfill:
                 return
-            logger.info("telemetry consent changed on disk; rebuilding recorder")
-            doomed = _take_provider_locked()
-            # Serve a no-op from here on: withdrawal is complete at this point, and
-            # an opt-in has nothing to serve until the build lands.
-            _recorder = MetricsRecorder(None)
-            _initialized = True
-            _built_consent = consent
-            rebuild_generation = _build_generation
+            if backfill:
+                _id_backfill_attempted = True
+                logger.info(
+                    "telemetry resource lacks the install id; minting and "
+                    "rebuilding recorder"
+                )
+                # Deliberately NOT taking the provider here: consent did not
+                # move, so the id-less recorder is still fully valid and keeps
+                # serving while its replacement is built. The swap happens
+                # under one lock hold below, so this path never exposes a
+                # no-op recorder and never discards a live metric.
+                rebuild_generation = _build_generation
+            else:
+                logger.info("telemetry consent changed on disk; rebuilding recorder")
+                doomed = _take_provider_locked()
+                # Serve a no-op from here on: withdrawal is complete at this
+                # point, and an opt-in has nothing to serve until the build
+                # lands. (A backfill must NOT come through here -- dropping the
+                # live recorder is the correct cost only when consent moved.)
+                _recorder = MetricsRecorder(None)
+                _initialized = True
+                _built_consent = consent
+                rebuild_generation = _build_generation
 
         # Outside the lock: a provider shutdown joins its reader threads.
         if doomed is not None:
@@ -785,17 +973,52 @@ def _consent_worker(generation: int) -> None:
         if not consent:
             return  # withdrawal builds nothing
 
+        # Off-loop by construction (this worker's own thread): mint the
+        # persisted install id if the beacon has not already, so the rebuild
+        # below picks it up read-only. _resource_attributes itself NEVER
+        # creates the id -- the first build runs synchronously on whatever
+        # thread touched telemetry first, possibly the event loop, and the
+        # mint is mkdir + mkstemp + link.
+        try:
+            beacon.install_id(create=True)
+        except Exception:  # a failed mint only costs the attribute
+            logger.debug("install id mint failed", exc_info=True)
         built = _build_recorder()
+        replaced = None
+        installed = False
         with _lock:
-            superseded = rebuild_generation != _build_generation
-            if not superseded:
-                _install_locked(built)
-        if superseded:
-            # Another flip overtook this build; drop it, and flush AFTER releasing
+            if rebuild_generation == _build_generation:
+                if backfill:
+                    if built.provider is not None:
+                        # Hot swap: retire the old provider and install its
+                        # replacement under ONE lock hold, so no caller ever
+                        # sees a no-op recorder on this path. For the swap's
+                        # duration both providers briefly exist (the old one
+                        # is flushed right below) -- the same one-export-cycle
+                        # overlap the re-enable path already documents.
+                        replaced = _take_provider_locked()
+                        _install_locked(built)
+                        installed = True
+                    # else: the rebuild FAILED (degraded, no live provider).
+                    # Swapping a healthy recorder for a dead one would turn a
+                    # missing label into silent total loss, so keep serving
+                    # the id-less recorder. The one-shot is spent
+                    # (_id_backfill_attempted), so this cannot churn.
+                else:
+                    _install_locked(built)
+                    installed = True
+        if not installed:
+            # Superseded by another flip, or a failed backfill rebuild that
+            # was deliberately not installed: drop this build, flushing AFTER
             # the lock so no get_recorder() waits on a reader join.
             stale = built.provider
             if stale is not None:
                 _flush_detached_provider(stale)
+        elif replaced is not None:
+            # Flush AFTER release: the retired readers' final export drains
+            # everything recorded up to the swap, so the transition loses
+            # nothing.
+            _flush_detached_provider(replaced)
     finally:
         with _lock:
             _check_in_flight = False
@@ -844,11 +1067,16 @@ def get_recorder() -> MetricsRecorder:
     # route runs on an asyncio.to_thread worker — and hand back None from a
     # non-Optional signature.
     rec = _recorder
-    if _initialized and rec is not None and not _consent_recheck_due():
+    if (
+        _initialized
+        and rec is not None
+        and not _consent_recheck_due()
+        and not _id_backfill_due()
+    ):
         return rec
     with _lock:
         if _initialized and _recorder is not None:
-            if _consent_recheck_due():
+            if _consent_recheck_due() or _id_backfill_due():
                 _schedule_consent_check_locked()
         elif _ever_built:
             # A shutdown dropped the recorder (the config route applying its own
@@ -869,6 +1097,17 @@ def get_recorder() -> MetricsRecorder:
 def _consent_recheck_due() -> bool:
     """Whether the recheck window has elapsed. Cheap enough for the hot path."""
     return (time.monotonic() - _consent_checked_at) >= _CONSENT_RECHECK_SECS
+
+
+def _id_backfill_due() -> bool:
+    """Whether the one-shot install-id backfill still needs a worker.
+
+    Two racy bool reads, deliberately unlocked (same class as ``_initialized``
+    on the fast path): the worst a stale read costs is one extra trip through
+    the locked branch. The ``attempted`` guard keeps a host whose mint failed
+    from disabling the fast path forever.
+    """
+    return _id_backfill_pending and not _id_backfill_attempted
 
 
 def _reap_readers_detached(readers: list) -> None:
@@ -1008,8 +1247,10 @@ def reset_for_testing() -> None:
     guarantees every test starts from a state with no worker able to mutate
     module globals underneath it.
     """
-    global _ever_built
+    global _ever_built, _id_backfill_pending, _id_backfill_attempted
     shutdown()
     _wait_for_in_flight_consent_worker()
     with _lock:
         _ever_built = False
+        _id_backfill_pending = False
+        _id_backfill_attempted = False
