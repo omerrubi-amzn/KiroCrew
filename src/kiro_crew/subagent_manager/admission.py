@@ -711,6 +711,25 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         """
         assert self._manager._on_spawn_approval is not None
         request_id: str = f"spawn:{info.id}"
+        # This wait has no deadline of its own (a human prompt has none), and
+        # until it returns the run is registered in ``_agents`` and counted by
+        # ``count`` — reported exactly like an agent that is executing. Mark the
+        # wait so every surface can tell "blocked on a human" from "broken", and
+        # log it under the run id so an operator who greps for a stuck id finds
+        # the reason. Both were missing: ``_awaiting_approval`` was set only for
+        # TOOL approvals raised INSIDE a run (``_run_inner``), never for the
+        # spawn gate that parks a run before it ever executes, and nothing was
+        # logged at all — so the state that means "waiting for you" was absent
+        # from the one wait that can hold a run at turn 0 indefinitely. Issue
+        # #6484 was reported off exactly that silence: the child process never
+        # appeared and no log line mentioned the run id.
+        info._awaiting_approval = True
+        logger.info(
+            "Subagent %s awaiting spawn approval (request_id=%s, parent=%s)",
+            info.id,
+            request_id,
+            info.parent_session_key or "<unowned>",
+        )
         try:
             from kiro_crew.security import (
                 redact_credentials,
@@ -726,6 +745,14 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         except Exception:
             logger.exception("Spawn approval failed for %s", info.id)
             approved = False
+        finally:
+            # A wait marker, not a sticky one: cleared on every exit — answered,
+            # denied, or the callback raising — so a run that goes on to execute
+            # is never mistaken for one still parked. A reap cancels this
+            # coroutine, and the reap's own terminal record is written
+            # synchronously before this ``finally`` can run, so the terminal
+            # message still sees the flag set.
+            info._awaiting_approval = False
 
         if not approved:
             info.done = True
