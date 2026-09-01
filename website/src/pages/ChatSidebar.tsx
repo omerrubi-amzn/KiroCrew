@@ -43,7 +43,8 @@ import useMoveUndo from '../hooks/useMoveUndo'
 import { useSelectInstance } from '../hooks/useSelectInstance'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
-import { PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT } from '../utils/previewFlags'
+import { PREVIEW_CREW, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT } from '../utils/previewFlags'
+import { useInstanceSessions } from '../hooks/useInstanceSessions'
 import { useLanguage } from '../i18n/LanguageProvider'
 import { useSessionActions } from '../hooks/useSessionActions'
 import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
@@ -564,6 +565,12 @@ interface Slot {
   key: string
   title?: string
   running: boolean
+  /** Remote origin, present ONLY on a row sourced from a connected remote
+   *  instance (see `useInstanceSessions`). Absent on every local slot, so a
+   *  consumer tests presence to decide whether the local-only affordances —
+   *  close, duplicate, rename, pin, drag-reorder, folder move — apply at all. */
+  instance_id?: string
+  instance_name?: string
   unread?: boolean
   // `pending_approval` rides on every ChatSlot payload; the sidebar reads it to
   // suppress the "your turn" dot and show the yellow "Needs approval" subtitle.
@@ -1410,6 +1417,9 @@ interface SessionRowProps {
   onCloseSession: (key: string) => void
   onMenuCloseAutoFocus: (e: Event) => void
   onSelectSlot?: (key: string) => void
+  /** Activate a row whose session lives on a remote instance. Distinct from
+   *  `onSelectSlot` because there is no local slot to switch to. */
+  onActivateRemote?: (instanceId: string) => void
   onOpenSlotInNewTab?: (key: string, opts?: { background?: boolean }) => void
   onOpenSource?: (slotKey: string, link: { url: string; kind: 'change' | 'issue' }) => boolean
 }
@@ -1428,9 +1438,16 @@ const SessionRow = memo(function SessionRow({
   isRenaming, renamingHere, renameValue, revealFlash, dragInFlight, rowAnimEnabled,
   defaultAgent, mode, isMobile, colorMode, installedAgents, tagById, paletteColors, boost, boostFor,
   renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
-  onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource,
+  onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onActivateRemote,
 }: SessionRowProps) {
   sessionRowRenderProbe.current?.(s.key)
+  // Remote origin, present only on a row sourced from a connected remote
+  // instance. Every local-only affordance below is gated on its ABSENCE rather
+  // than disabled: a control that looks actionable and silently does nothing is
+  // worse than no control, and none of close / duplicate / rename / reorder can
+  // be honoured for a session whose slot lives on another machine.
+  const remoteInstanceId = s.instance_id
+  const remoteInstanceName = s.instance_name || s.instance_id
   // memo() bails out of the provider-level repaint, so the row subscribes to
   // catalog loads directly (same contract as the ChatSidebar shell) — its
   // i18nT strings must re-translate even when no prop moves.
@@ -1472,7 +1489,13 @@ const SessionRow = memo(function SessionRow({
     // can only reach the chat pane: dragging a session into the open chat
     // works, while manual reordering stays unavailable by construction.
     // Board columns keep the separate native-HTML5 drag (their own scope).
-    const dndRow = scope === 'list' || scope === 'flat'
+    // Drag is a LOCAL-slot gesture: dnd-kit's drop handlers reorder local slots,
+    // move them between folders and drop them onto the chat pane, all keyed by a
+    // slot key that exists in the local store. A remote row has no local slot, so a
+    // drag could only resolve to nothing or — if a peer key ever coincided with a
+    // local one — to the WRONG session. Excluded by construction rather than
+    // handled per drop target.
+    const dndRow = (scope === 'list' || scope === 'flat') && !remoteInstanceId
     const agentName = s.agent || defaultAgent || ''
     // A DIVERGENCE, not a status: the row is advertising `agentName` while a
     // different agent answers the session — usually an app agent that was
@@ -1782,10 +1805,15 @@ const SessionRow = memo(function SessionRow({
         <ContextMenu>
           <ContextMenuTrigger asChild>
         <div ref={dndRow ? setNodeRef : undefined} {...(dndRow ? listeners : {})}
-          data-draggable={(!isRenaming).toString()}
+          data-draggable={(!isRenaming && !remoteInstanceId).toString()}
           className={`session-row group relative flex items-start pl-3.5 pr-3 py-2 rounded-md text-sm transition-all select-none ${isActive ? !connected ? 'session-active text-text-strong bg-accent-subtle cursor-not-allowed' : 'session-active text-text-strong bg-accent-subtle cursor-pointer' : !connected ? 'text-muted opacity-50 cursor-not-allowed' : 'text-muted hover:text-text hover:bg-bg-hover cursor-pointer'} ${rowColor ? 'session-colored' : ''} ${rowColor && colorMode === 'gradient' ? 'session-gradient' : ''} ${isDragging ? 'opacity-40' : ''} ${revealFlash ? `session-reveal-flash${revealFlash === 'fade' ? ' session-reveal-flash-fade' : ''}` : ''}`}
           style={boostStyle as React.CSSProperties}
-          draggable={(!dndRow && !isRenaming) && (connected || isActive)}
+          draggable={
+            // Both drag paths are off for a remote row. Note the polarity: native
+            // HTML5 drag is enabled precisely when dnd-kit is NOT, so gating
+            // `dndRow` alone would have SWITCHED THIS ON rather than off.
+            (!dndRow && !isRenaming && !remoteInstanceId) && (connected || isActive)
+          }
           {...offlineProps(connected, 'switch sessions')}
           role="button"
           tabIndex={0}
@@ -1865,6 +1893,11 @@ const SessionRow = memo(function SessionRow({
             // /forking still works — those are local ops (or short-circuit) that
             // don't depend on gateway state.
             if (!connected) return
+            // A remote row has no local slot, so `switchSlot` would resolve
+            // nothing and clear the transcript. Activating it switches to that
+            // instance's pane — the same outcome the federated-search rows in
+            // Older Sessions already produce.
+            if (remoteInstanceId) { onActivateRemote?.(remoteInstanceId); return }
             // Modifier-click = open as a background tab, matching the
             // editor/browser convention. The platform split is deliberate:
             // Ctrl+click IS a right-click on macOS, so honouring it there would
@@ -1922,6 +1955,21 @@ const SessionRow = memo(function SessionRow({
                 *  rare agent switch, and the repo's animation invariant is
                 *  framer-only (no new CSS @keyframes). */}
               <span key={agentName || 'empty'} className={`truncate shrink-0 ${resolvedSlotTags.length > 0 || agentDiverged ? 'max-w-[50%]' : ''}`}>{agentName || '\u00A0'}</span>
+              {/* Remote-origin badge. Info tone rather than accent because accent
+                *  already carries two meanings in this rail (the agent label and
+                *  the running-turn dot); the 9px server glyph is the non-colour
+                *  half of the cue, so the distinction survives a colour-vision
+                *  deficiency. Same classes the Older Sessions rows use, so one
+                *  meaning keeps one look across both regions. */}
+              {remoteInstanceId && (
+                <span
+                  title={remoteInstanceName}
+                  className="shrink-0 inline-flex items-center gap-0.5 text-[10px] px-1 rounded bg-info-subtle text-info border border-info/40"
+                >
+                  <Server size={9} aria-hidden="true" />
+                  {remoteInstanceName}
+                </span>
+              )}
               {agentDiverged && (
                 // Plain secondary TEXT, deliberately not a badge, a colour or an
                 // icon. It is informational — the session works, it is simply
@@ -2122,7 +2170,12 @@ const SessionRow = memo(function SessionRow({
            *  on focus-within, so the focused rename input would otherwise make it
            *  pop up and overlap the input's right edge. Mirrors the folder-header
            *  guard below (!(editingId === folder.id && editScope === 'list')). */}
-          {!renamingHere && (isMobile ? (
+          {/* A remote row shows NO action group at all: every entry in it (⋯ menu,
+           *  duplicate, close, rename, pin, move-to-folder) is a local-slot
+           *  operation that cannot reach a session on another machine. Omitting
+           *  beats disabling — the same call `historyRow` makes for its delete
+           *  button. */}
+          {!renamingHere && !remoteInstanceId && (isMobile ? (
             <div className="absolute top-1/2 -translate-y-1/2 right-1.5 flex items-center gap-0.5">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -2149,9 +2202,9 @@ const SessionRow = memo(function SessionRow({
           ))}
         </div>
           </ContextMenuTrigger>
-          <ContextMenuContent className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
+          {!remoteInstanceId && <ContextMenuContent className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
             <SessionActionsMenu variant="context" {...rowMenuProps} />
-          </ContextMenuContent>
+          </ContextMenuContent>}
         </ContextMenu>
           )}
         </DndDraggable>
@@ -2394,6 +2447,11 @@ function ChatSidebar({
   // partial stores omit the instances slice entirely (unlike the instances-own
   // components, which only ever mount with it).
   const hasWarmInstances = useAppSelector(s => Object.keys(s.instances?.warm ?? {}).length > 0)
+  // Live sessions on connected remote instances, merged into the list below.
+  // The flag is read HERE and passed in, so a user who has not opted in issues no
+  // per-instance request at all — this component mounts for every dashboard user,
+  // so gating the render would gate the rows but not the wire.
+  const instanceSessions = useInstanceSessions(usePreviewFlag(PREVIEW_INSTANCE_SESSIONS))
   const historySearchResults = useDebouncedSessionSearch(
     historyFilter, s => s, slotTitleDigest, hasWarmInstances,
   )
@@ -2408,6 +2466,22 @@ function ChatSidebar({
   const instancesData = instancesQuery.data?.instances
   const instancesList = useMemo(() => instancesData ?? [], [instancesData])
   const { selectInstance } = useSelectInstance(instancesList)
+  // A REFERENTIALLY STABLE handle on `selectInstance`, because this is handed to
+  // every memoized SessionRow. `useSelectInstance` already wraps it in
+  // `useCallback`, but its dep list includes `connectMutation` — a react-query
+  // object with a fresh identity on every render — so the callback itself changes
+  // identity every render. Passing it straight through re-rendered EVERY row on
+  // every shell commit, which is the exact regression
+  // `ChatSidebar.rowMemo.test.tsx` exists to catch (it caught this one in CI).
+  // The ref is written on each render and read inside a never-changing callback,
+  // so rows see one identity for the life of the component while the call still
+  // reaches the latest closure.
+  const selectInstanceRef = useRef(selectInstance)
+  selectInstanceRef.current = selectInstance
+  const activateRemoteInstance = useCallback(
+    (id: string) => { selectInstanceRef.current(id) },
+    [],
+  )
   // Connected crews, for the "New chat on crew" entry. `warm` is the authority
   // on which peers hold a live tunnel (it holds the loopback port + minted
   // token); `instancesList` only supplies the display name, so a crew missing
@@ -3678,7 +3752,21 @@ function ChatSidebar({
 
   const filteredSlots = useMemo(() => {
     if (dragFrozen) return frozenSlotsRef.current
-    const next = slots
+    // Live sessions from connected remote instances join the LIVE list, not the
+    // history drawer: `api/chat/slots` returns the peer's OPEN sessions, and
+    // filing those under "Older Sessions" (empty state: "closed tabs appear
+    // here") stated the wrong thing about them. Merged ahead of the filter and
+    // the sort so a remote row is narrowed and ordered by exactly the same rules
+    // as a local one.
+    //
+    // A remote row carries no `folder_id`, no `tags`, no `order` and no `pinned`,
+    // which is what keeps it out of the board's tag columns and the folder tree's
+    // folders by construction rather than by a special case. The board branch
+    // surfaces the resulting gap explicitly instead of dropping rows silently.
+    const merged = instanceSessions.rows.length === 0
+      ? slots
+      : [...slots, ...(instanceSessions.rows as unknown as Slot[])]
+    const next = merged
       // Derived from filterDimensions — the single declaration above — so this
       // site cannot hold a filter dimension the other consumers miss.
       .filter(slot => filterDimensions.every(d => d.filtersRow === null || d.filtersRow(slot)))
@@ -3692,7 +3780,7 @@ function ChatSidebar({
     frozenSlotsRef.current = next
     return next
   },
-    [slots, filterDimensions, searchRanked, pinned, sortKey, dragFrozen]
+    [slots, filterDimensions, searchRanked, pinned, sortKey, dragFrozen, instanceSessions.rows]
   )
 
   // Which lane the sidebar is actually rendering. Mirrors the render branches
@@ -4673,6 +4761,7 @@ function ChatSidebar({
     const renamingHere = renamingSlot === s.key && renameScope === scope
     return (
       <SessionRow key={s.key} slot={s} orderStamp={sessionRowOrderStamp++}
+        onActivateRemote={activateRemoteInstance}
         showDivider={showDivider} scope={scope} navScope={navScope}
         isActive={activeSlot === s.key} connected={connected} isOut={poppedOut.has(s.key)}
         isPinned={pinned.has(s.key)} isUnread={unreadSet.has(s.key)} isRunning={runningSet.has(s.key)}
@@ -5961,6 +6050,23 @@ function ChatSidebar({
         </div>
       )}
       <LayoutGroup id="chat-slots">
+        {/* An instance that is CONNECTED but did not answer contributes no rows.
+          *  Saying so is the difference between "that instance has nothing open" and
+          *  "we could not ask": without this line the list silently claims a
+          *  completeness it does not have, which is worse than showing fewer rows.
+          *  Placed ABOVE the view branches so it appears in the flat lane, the board
+          *  and the folder tree alike — an unreachable peer is not a property of one
+          *  layout. Non-blocking by design: local rows are unaffected. */}
+        {instanceSessions.failed.length > 0 && (
+          <div className="mx-2 mt-2 px-2 py-1.5 rounded-md bg-warn-subtle border border-warn/40 text-warn text-[11px] flex items-center gap-1.5">
+            <TriangleAlert size={11} aria-hidden="true" className="shrink-0" />
+            <span className="min-w-0 truncate">
+              {i18nT('pages.chatSidebar.sessions_from_instance_unavailable', {
+                names: instanceSessions.failed.join(', '),
+              })}
+            </span>
+          </div>
+        )}
         {flatLaneActive ? (
           // Flat view: every chat exploded out of its folder into one lane.
           // Removes only the folder rendering hierarchy — sort, pin priority,
@@ -6113,6 +6219,19 @@ function ChatSidebar({
         ) : (
           // Trello-style horizontal column strip
           <div className="flex-1 min-h-0 flex flex-col">
+          {/* Board columns match on TAGS and state lanes, and a remote row has
+            *  neither — so it belongs to no column and would simply not appear.
+            *  Say so rather than dropping rows silently: an unexplained absence
+            *  reads as the feature being broken, which is the same failure mode
+            *  as an unreachable instance contributing nothing with no notice. */}
+          {instanceSessions.rows.length > 0 && (
+            <div className="mx-2 mt-2 px-2 py-1.5 rounded-md bg-info-subtle border border-info/40 text-info text-[11px] flex items-center gap-1.5">
+              <Server size={11} aria-hidden="true" className="shrink-0" />
+              <span className="min-w-0">
+                {i18nT('pages.chatSidebar.remote_sessions_not_shown_in_board_view', { count: instanceSessions.rows.length })}
+              </span>
+            </div>
+          )}
           <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2" data-testid="column-strip">
             {orderedColumns.map((col, colIdx) => {
               const colSlots = filteredSlots.filter(s => columnMatches(col, s))
@@ -6491,6 +6610,9 @@ function ChatSidebar({
                   ((s.title || '') + s.key).toLowerCase().includes(historyFilter.toLowerCase())
                 // Additive rather than a boolean OR: here the backend result IS the
                 // source list, so filtering `history` instead would drop backend-only hits.
+                // Remote instance sessions are NOT merged here: they are the peer's
+                // LIVE slots and join the live sessions list above. Merging them into
+                // history as well would render each remote row twice.
                 const filteredHistory = (() => {
                   if (!historyFilter) return history
                   if (historyFilter.trim().length >= SEARCH_MIN_CHARS && historySearchResults) {
