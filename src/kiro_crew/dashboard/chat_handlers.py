@@ -2406,7 +2406,28 @@ async def _reset_slot_session(
     microseconds ago, which cannot have posted a card yet.
     """
     _unblock_pending_waits(state, slot)
-    return await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
+    try:
+        reloaded = await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
+    except BaseException:
+        # Raised or cancelled mid-teardown: the session is in a state this slot
+        # cannot vouch for, so neither is its verdict. Unknown fails open.
+        slot.record_model_withheld(None)
+        raise
+    if reloaded:
+        # The withhold verdict describes the session that advertised the model
+        # list, not the slot, so it goes with the session. Routed through this one
+        # funnel for the reason above: the switch handlers that reset a session
+        # are exactly the ones that can change which models the next session will
+        # advertise (agent, workspace, and the model pick itself), and a verdict
+        # surviving that would label the new session from the old one's
+        # entitlement.
+        #
+        # Gated on the reset having HAPPENED. `skip_if_busy` declines when a turn
+        # is in flight, leaving the live session -- and therefore its verdict --
+        # untouched; dropping there would relabel a runnable pin `auto`, which is
+        # the defect the verdict is carried to remove.
+        slot.record_model_withheld(None)
+    return reloaded
 
 
 def _resolve_stop_event(slot: _ChatSlot, outcome: str) -> None:
@@ -3649,6 +3670,9 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
         return attached
 
     await state.sessions.discard_conversation(key, replay=replay)
+    # The fresh conversation will advertise its own model list, so the previous
+    # one's withhold verdict no longer describes this slot.
+    slot.record_model_withheld(None)
     sel().log_api_access(
         caller=request.get("app", "") or "dashboard",
         operation="slot_reset_conversation",
