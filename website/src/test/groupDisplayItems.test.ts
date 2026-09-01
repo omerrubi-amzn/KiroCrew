@@ -386,3 +386,66 @@ describe('applyRunningState', () => {
     }
   })
 })
+
+describe('invisible-only assistant rows (#7534)', () => {
+  // A quiet monitor cycle's "say nothing" reply is a bare U+200B. Each such
+  // finalized assistant row used to draw an empty bubble in the transcript
+  // (and in a fork, which replays the whole history).
+  const ZWSP = '\u200b'
+
+  it('drops a ZWSP-only assistant row from the transcript', () => {
+    const { turns } = groupDisplayItems([
+      msg('user', 'watch the CR'),
+      msg('assistant', 'on it'),
+      msg('nudge', 'cycle 2'),
+      msg('assistant', ZWSP),
+    ])
+    const roles: string[] = []
+    for (const d of turns) {
+      if (d.kind === 'turn') roles.push(...d.items.map(it => (it.kind === 'single' ? it.msg.role : 'group')))
+      else if (d.kind === 'single') roles.push(d.msg.role)
+    }
+    expect(roles).toEqual(['user', 'assistant', 'nudge'])
+  })
+
+  it('drops whitespace-and-format-char-only assistant rows too', () => {
+    const { turns } = groupDisplayItems([
+      msg('user', 'u'),
+      msg('assistant', ` ${ZWSP} \n\u200c\u2060 `),
+    ])
+    const singles = turns.flatMap(d => (d.kind === 'turn' ? d.items : [d]))
+    expect(singles.filter(it => it.kind === 'single' && it.msg.role === 'assistant')).toHaveLength(0)
+  })
+
+  it('keeps an assistant row whose real content merely contains a ZWSP', () => {
+    const { turns } = groupDisplayItems([msg('user', 'u'), msg('assistant', `done${ZWSP} — pushed`)])
+    const singles = turns.flatMap(d => (d.kind === 'turn' ? d.items : [d]))
+    expect(singles.some(it => it.kind === 'single' && it.msg.role === 'assistant')).toBe(true)
+  })
+
+  it('keeps an empty streaming row — the live placeholder is not a finalized reply', () => {
+    const { turns } = groupDisplayItems([msg('user', 'u'), msg('streaming', '')])
+    const singles = turns.flatMap(d => (d.kind === 'turn' ? d.items : [d]))
+    expect(singles.some(it => it.kind === 'single' && it.msg.role === 'streaming')).toBe(true)
+  })
+
+  it('keeps an invisible assistant row that carries file_changes — the chips are its visible content', () => {
+    // GPT review catch (#7534): _flush_file_changes attaches diff chips to the
+    // last assistant row on every exit path, so a quiet monitor cycle that
+    // edited files is exactly an invisible-text row with file_changes.
+    const withChips = {
+      ...msg('assistant', ZWSP),
+      meta: { file_changes: [{ path: '/a.ts', before: 'x', after: 'y' }] },
+    } as ChatMessage
+    const { turns } = groupDisplayItems([msg('user', 'u'), withChips])
+    const singles = turns.flatMap(d => (d.kind === 'turn' ? d.items : [d]))
+    expect(singles.some(it => it.kind === 'single' && it.msg.role === 'assistant')).toBe(true)
+  })
+
+  it('still drops an invisible assistant row whose file_changes is empty', () => {
+    const emptyChips = { ...msg('assistant', ZWSP), meta: { file_changes: [], turn_stats: {} } } as ChatMessage
+    const { turns } = groupDisplayItems([msg('user', 'u'), emptyChips])
+    const singles = turns.flatMap(d => (d.kind === 'turn' ? d.items : [d]))
+    expect(singles.filter(it => it.kind === 'single' && it.msg.role === 'assistant')).toHaveLength(0)
+  })
+})
