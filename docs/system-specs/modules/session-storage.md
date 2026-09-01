@@ -605,6 +605,86 @@ would put a link where the session's data belongs — leaving a dangling pointer
 the batch is emptied. Only a link resolving *within* the batch reaches this check;
 `_staged_path` already refuses one that escapes.
 
+### All three removal paths are descriptor-bound, and one module owns the mechanism
+
+Emptying is the largest of the three removals but not the only one. Discarding a
+fully-restored batch and cleaning up a batch no session was staged into also remove a
+whole directory, and both did it with `shutil.rmtree(path)` - which re-resolves every
+ancestor, so a directory above the trash swapped to a link after the caller's own by-path
+read is followed and the removal lands outside the trash. Both now go through
+`pinned_fs.remove_tree_pinned`: parent chain pinned one `openat` per component, batch
+opened through it `O_NOFOLLOW`, one scan, and every removal inside addressed by a
+descriptor whose inode that scan recorded.
+
+Pinning is the weaker half of that, and the spec says so because the code does.
+`Path.resolve()` FOLLOWS an ancestor that is already a link, so a swap landing before the
+resolve produces a faithful pinned walk to the wrong tree. What closes that is an IDENTITY:
+each caller records the batch's `(st_dev, st_ino)` before its own by-path read - at
+`target.mkdir(...)` under the mutation lock on the staging path, and before the leftover
+scan on the restore path - and the approval hook compares the pinned root's `fstat` against
+it as its first question. An unreadable identity refuses rather than proceeding.
+
+The content checks come second and are not what carries this. The approval also re-asks,
+from ONE inode-verified read of ONE file, that the manifest's header claims this batch's own
+directory name, and that NOTHING but the manifest remains - not "nothing unlisted", nothing
+at all. Both callers arrive with the batch already empty of files: the restore path has moved
+every listed file back out, and the staging path has a manifest with no entries. So a file at
+a listed path is not the listed file; it arrived at that name afterwards and may be the only
+copy of whatever it is, and consulting the listing would authorise deleting exactly that on
+the strength of a name the manifest happens to mention. The header check establishes that
+emptying the batch is *correct*, not that it *is* the batch: an actor who can write into the
+tree a swapped link points at can plant a header naming the selected batch, and every content
+question then answers yes about the wrong directory. An inode cannot be forged by writing
+files. A withheld approval removes nothing and keeps the batch, which stays listed and
+restorable; reporting a success that did not happen is what `ignore_errors=True` did.
+
+Where the platform has no `openat`/`O_NOFOLLOW`, these two paths remove the batch through
+`rename-verify-remove` instead: `_stage_batch_by_name` renames it aside inside the trash root,
+verifies `(st_dev, st_ino)` on the RENAMED directory against the identity the caller captured,
+and only the staged name is removed; a mismatch or an unreadable identity puts the directory
+back under the name the user saw, and so does a tree that will not go. Refusing outright was an
+earlier answer here and it was wrong: this branch is the whole of Windows, so refusing left a
+batch behind after every restore and every rolled-back move, still listing sessions it no longer
+held - five pre-existing tests read that as a failure, and so would a user. What the rename buys
+is that the approved name no longer exists once it has happened, so nothing can be substituted
+at it, and the identity is checked on the directory that was actually moved. What it does not
+buy: the removal still resolves the staging path, so an actor who can OBSERVE that name inside
+the window can redirect it through an ancestor swapped afterwards. That residual is accepted on
+this platform for all three callers - the explicit empty and the two cleanups - through one
+owner rather than three spellings.
+
+Because the cleanup can now DECLINE, a fully restored batch can outlive it - and every entry
+in its manifest describes a file the restore already moved back OUT, so that batch shows a
+user sessions that are not in it and offers to restore them. That stale listing is an ACCEPTED
+RESIDUAL, not an oversight: clearing it needs a write to the batch path, and there is nowhere
+safe to put one. After the cleanup the descriptor is closed and every refusal is itself
+evidence the path may be redirected, so writing then answers a swap by writing through it.
+Before the cleanup, the full-restore branch has no write at all today, so adding one hands
+`atomic_write` - which REPLACES its destination - a path that a batch swapped to a link points
+wherever an actor chose, including another batch's manifest, whose staged sessions would
+become unlistable. A stale listing is visible and reversible; that is not. So neither cleanup
+path writes to the batch, the full-restore branch of `_restore_locked` does not either, and
+`empty_trash` clears the batch on the user's own say-so (verified in
+`test_a_full_restore_never_writes_to_the_batch_it_is_leaving`). The partial-restore branch
+keeps its pre-existing rewrite: it has to record what is still staged, and it is not reached
+through a refusal.
+
+`rename-verify-remove` - move a name to `.<name>.removing-<random>` in the same parent,
+re-check the identity there through the parent's descriptor, remove only that name, and
+rename BACK only when the identity matched - was spelled inline three times: the interior
+directories, the batch directory, and the coarse path. It is now
+`pinned_fs.remove_dir_verified`, with the pinned scan and the identity-verified chain-open
+beside it, and `session_storage` keeps only the policy: which map authorises the removal,
+what a refusal means to the user, and how it is worded. That split is deliberate rather than
+tidy-up: per-call-site respelling of this mechanism is what `pinned_fs` was created to end
+after #2446 and #2447, and a fourth copy would have repeated it. The descriptor-less platform
+has its own owner, `_stage_batch_by_name`, because `pinned_fs` cannot serve it -
+`remove_dir_verified` addresses a parent descriptor and that is precisely what this platform
+lacks - and all three callers there (the explicit empty and the two cleanups) go through it
+rather than respelling the rename. Which mechanism a call site gets is an explicit branch at
+the call site rather than a fallback inside the primitive: `pinned_fs` refuses by design rather
+than silently substituting a weaker one.
+
 ### The origin is derived, not trusted
 
 A manifest record's `origin` is not information restore needs: the staged path
@@ -953,6 +1033,12 @@ user's "empty this batch" is consent for nothing while destroying something. Suc
 batch is skipped and logged rather than deleted, so `freed_bytes` under-reports
 instead of the trash over-deleting. `TestEmptyTrash` and
 `test_restore_never_deletes_a_file_the_manifest_omits` cover both directions.
+
+All three now also re-establish the answer through the descriptor they remove by, not only
+by path. The by-path read is a pre-screen that produces the user-facing count; the pinned
+re-read is what the removal is bound to, because a file arriving after the pre-screen - or
+an ancestor swapped after it - makes the by-path answer describe a directory the removal is
+no longer addressing.
 
 ## Constants
 
