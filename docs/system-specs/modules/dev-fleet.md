@@ -665,6 +665,49 @@ the pinned `/assets` route and the staged `index.html` on the same hashed
 chunks. The run script stops at the first non-zero step, so a build or staging
 failure fails the sync rather than silently leaving the symlink in place.
 
+### Backend-only sync: skipping the frontend half at runtime
+
+A sync that changes nothing under `website/` pays both frontend costs to
+reproduce what is already on disk: `npm ci --prefix website` deletes and
+reinstalls a tree from an unchanged lockfile, and the build re-emits a
+byte-identical bundle. Both steps are still **assembled**; each carries a
+`skip_if_frontend_unchanged` marker on its wrapped step dict (beside `stash`), and
+the generated runner decides. `frontend_skip.may_skip_frontend` is the decision,
+in its own stdlib-only module executed from a by-path snapshot exactly like
+`npm_preflight` — the runner must not import `kiro_crew`.
+
+The decision is **deferred into the runner** because its evidence is a diff
+against `refs/kirocrew/sync-base-<pid>`, which does not exist until the run's own
+fetch step creates it. The other side of that diff is the **pre-merge HEAD OID**,
+resolved before the run and carried in the marker: the runner reaches the frontend
+steps only after the `merge --ff-only <ref>` step has fast-forwarded HEAD onto
+that same ref, so a `HEAD`-relative diff would compare the ref with itself and be
+empty on every successful sync — a gate that always says "skip".
+
+It skips only on strong evidence of all four:
+
+1. `git diff --name-only <pre-merge HEAD> <ref> -- website` is empty.
+2. A three-way sha256 match of the incoming ref's `package-lock.json`, the working
+   tree's, and npm's own hidden `.package-lock.json` written inside `node_modules`.
+   Stronger than "the directory is non-empty", because `npm ci` is also what repairs
+   the partially-installed tree that bar would wave through.
+3. A usable bundle is staged at `static/dist/index.html` — `node_modules` and the
+   built dist are independent artifacts, and the build+stage step used to repair an
+   absent dist as a side effect of running unconditionally.
+4. That staged bundle is the **last build's output** (`static/dist/index.html`
+   byte-matches `website/dist/index.html`). `_stage_dist` deliberately preserves the
+   previously served bundle when a build or stage fails, so a sync that merged
+   `website/` changes and then failed at the build leaves a bundle older than the
+   source — and the retry that used to repair it has an empty diff of its own,
+   because that merge landed. Provenance is what withholds the skip there.
+
+The two steps are **coupled**: one verdict, cached, so they skip together or
+neither does. Skipping is conservative everywhere else — a `website/` change, an
+unverifiable tree, a bundle of unknown provenance, git unavailable, or a helper
+snapshot that could not be staged (a full `TMPDIR` logs and leaves the steps
+untagged) all mean "build, as before". On an edition checkout neither step exists,
+so nothing carries the marker and the skip is a guarded no-op.
+
 ### Dependency preflight and the `node_modules` transaction
 
 `npm ci` deletes `node_modules` before it installs, so a registry refusal used to
