@@ -107,6 +107,19 @@ export default [
     },
   },
   {
+    // `.mjs` build/codegen scripts under `src/` are matched by no other block, so
+    // they were linted with an EMPTY rule set: the `no-eval` directive in
+    // `crew-ghost-sprite.gen.mjs` sat above a real `eval()` and was reported as
+    // unused, which is a warning that can never be burned down without deleting a
+    // true statement. Enabling the rule the directive names makes it live, so the
+    // exemption is a deliberate, reviewed one instead of an accident of config
+    // coverage — and a second `eval()` here would now be an error.
+    files: ['src/**/*.mjs'],
+    rules: {
+      'no-eval': 'error',
+    },
+  },
+  {
     // Test doubles are exempt: a `vi.mock` that swaps a portalled Radix dropdown
     // for a plain <select> is the ESTABLISHED way to make one driveable in jsdom
     // (Radix commits discrete events through flushSync, which throws inside
