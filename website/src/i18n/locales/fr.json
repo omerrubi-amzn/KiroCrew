@@ -1054,7 +1054,13 @@
         "command": "Commande",
         "setting": "Paramètre",
         "view": "Vue"
-      }
+      },
+      "placeholder_argument": "Saisissez une valeur…",
+      "argument_invalid": "Cette commande n’accepte pas cette valeur.",
+      "argument_withdrawn": "Cette commande n'est plus disponible.",
+      "argument_changed": "Cette commande a changé. Vérifiez ce qui sera envoyé, puis appuyez à nouveau sur Entrée.",
+      "will_send": "Sera envoyé",
+      "will_send_clipped": "Faites défiler pour lire la suite — cette instruction continue plus bas."
     },
     "crewCompanion": {
       "accessory": {

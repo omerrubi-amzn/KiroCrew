@@ -4655,7 +4655,13 @@
         "command": "কমান্ড",
         "setting": "সেটিং",
         "view": "ভিউ"
-      }
+      },
+      "placeholder_argument": "একটি মান লিখুন…",
+      "argument_invalid": "এই কমান্ড ওই মান নেয় না।",
+      "argument_withdrawn": "সেই কমান্ডটি আর উপলব্ধ নেই।",
+      "argument_changed": "এই কমান্ডটি বদলে গেছে। কী পাঠানো হবে দেখে নিয়ে আবার Enter চাপুন।",
+      "will_send": "পাঠানো হবে",
+      "will_send_clipped": "বাকিটা পড়তে স্ক্রল করুন — এই নির্দেশ নিচে চলতে থাকে।"
     },
     "awsControl": {
       "manifest": {

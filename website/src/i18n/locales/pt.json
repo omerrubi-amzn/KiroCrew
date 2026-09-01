@@ -4733,7 +4733,13 @@
         "command": "Comando",
         "setting": "Configuração",
         "view": "Visualização"
-      }
+      },
+      "placeholder_argument": "Digite um valor…",
+      "argument_invalid": "Este comando não aceita esse valor.",
+      "argument_withdrawn": "Esse comando já não está disponível.",
+      "argument_changed": "Este comando mudou. Verifique o que será enviado e prima Enter novamente.",
+      "will_send": "Será enviado",
+      "will_send_clipped": "Percorra para ler o resto — esta instrução continua abaixo."
     },
     "awsControl": {
       "manifest": {
