@@ -3016,58 +3016,445 @@ def _jira_is_cloud(host: str) -> bool:
     return host.lower().endswith(".atlassian.net")
 
 
-def _adf_to_plain_text(node: Any, *, _depth: int = 0) -> str:
-    """Recursively extract plain text from an Atlassian Document Format tree.
+_ADF_MAX_DEPTH = 64
 
-    ADF is the JSON document model used by Jira Cloud v3. This performs a
-    depth-limited traversal (max 64 levels) to prevent stack exhaustion from
-    malformed or maliciously deep documents.
-    """
-    _MAX_DEPTH = 64
-    if _depth > _MAX_DEPTH:
-        return ""
-    if not isinstance(node, dict):
-        return ""
-    node_type = node.get("type")
-    # Text leaf node
-    if node_type == "text":
-        return str(node.get("text") or "")
-    # Inline card (link)
-    if node_type == "inlineCard":
-        attrs = _as_dict(node.get("attrs"))
-        return str(attrs.get("url") or "")
-    # Mention (user/team @-mention) — extract the visible name
-    if node_type == "mention":
-        attrs = _as_dict(node.get("attrs"))
-        return str(attrs.get("text") or attrs.get("id") or "")
-    # Emoji — extract the shortName or fallback text
-    if node_type == "emoji":
-        attrs = _as_dict(node.get("attrs"))
-        return str(attrs.get("text") or attrs.get("shortName") or "")
-    # Hard break — render as newline
-    if node_type == "hardBreak":
-        return "\n"
-    parts: list[str] = []
-    for child in _as_list(node.get("content")):
-        parts.append(_adf_to_plain_text(child, _depth=_depth + 1))
-    text = "".join(parts)
-    # Block-level nodes get a trailing newline for readability.
-    block_types = {
+# ADF node types that occupy a line of their own. Everything else is treated as
+# an inline run, so an unknown node still contributes its text rather than
+# vanishing.
+_ADF_BLOCK_TYPES = frozenset(
+    {
+        "doc",
         "paragraph",
         "heading",
+        "codeBlock",
+        "blockquote",
+        "panel",
+        "rule",
         "bulletList",
         "orderedList",
-        "listItem",
-        "blockquote",
-        "codeBlock",
-        "rule",
+        "taskList",
         "table",
-        "tableRow",
-        "tableCell",
+        "expand",
+        "nestedExpand",
     }
-    if node_type in block_types and text and not text.endswith("\n"):
-        text += "\n"
-    return text
+)
+
+# List types, which follow their sibling block without a blank line so the
+# nested list stays part of the same (tight) list item.
+_ADF_LIST_TYPES = frozenset({"bulletList", "orderedList", "taskList"})
+
+# Inline markdown/HTML syntax openers. The panel renders a source's
+# ``description`` and every comment ``body`` through MarkdownRenderer
+# (react-markdown + remark-gfm + rehypeRaw), so ADF *text* that merely looks
+# like markup would otherwise be re-parsed as markup: a literal ``**`` in a
+# Jira description would turn bold, a literal ``<b>`` would be eaten by the
+# HTML sanitizer, and a literal ``&copy;`` would be decoded to a copyright sign.
+# ``!`` earns its place for a different reason: this converter emits real ``[``
+# for a link, a mention card and a media node, so a literal ``!`` landing
+# immediately before one would splice into image syntax and the panel would
+# auto-fetch a provider-controlled URL -- the beacon the media-as-link form
+# exists to avoid. Backslash-escaping these keeps ADF text literal, leaving the
+# marks and block types below as the only things that become real markdown.
+# Every character here is ASCII punctuation, which CommonMark says may always be
+# backslash-escaped.
+_MD_INLINE_ESCAPE = str.maketrans({ch: "\\" + ch for ch in "\\`*_[]<>|~&!"})
+
+# A text run that OPENS a line can also start a *block* construct the inline set
+# above does not cover (``# heading``, ``- item``, ``1. item``). Only paragraph
+# and list-item text is passed through this: a heading's own ``#`` prefix
+# already claims its line, and list markers are added by the list renderer after
+# its items are rendered.
+_MD_BLOCK_LEAD_RE = re.compile(r"^([ \t]*)(?:([-+#])|(\d{1,9})([.)]))", re.MULTILINE)
+
+# One highlighter token, and nothing that could leave the fence's own line.
+_MD_CODE_LANGUAGE_RE = re.compile(r"^[A-Za-z0-9+#._-]{1,32}$")
+
+
+def _md_escape_inline(text: str) -> str:
+    """Backslash-escape the markdown syntax characters in literal ADF text."""
+    return text.translate(_MD_INLINE_ESCAPE)
+
+
+def _adf_attr_label(value: Any) -> str:
+    """Prepare an ADF *attribute* string for emission as an inline label.
+
+    Redact, collapse whitespace, then escape -- in that order, and all three for
+    the same reason.
+
+    An attribute is a label, not prose. Where a text node's own newline is
+    content, a newline inside an attribute would end the construct the attribute
+    sits in and let the remainder become document structure, so whitespace is
+    collapsed first. Escaping then keeps the rest literal -- and because escaping
+    inserts a backslash, it would hide a credential from the payload-level
+    ``_redact_provider_data`` pass that runs afterwards, so redaction has to
+    happen here, before the backslash lands.
+
+    Doing it here rather than in a pre-pass over the whole tree is what keeps the
+    work bounded: this runs inside the converter's own depth-capped traversal,
+    while ``_redact_provider_data`` recurses without a cap and raises
+    ``RecursionError`` on a document a few hundred levels deep.
+    """
+    collapsed = re.sub(r"\s+", " ", str(_redact_provider_data(str(value or "")))).strip()
+    return _md_escape_inline(collapsed)
+
+
+def _md_code_language(value: Any) -> str:
+    """The fence info string for an ADF code block's ``language`` attribute.
+
+    A fence's info string runs to the end of its line, so a newline-bearing (or
+    merely space-bearing) attribute would close the fence early and turn
+    provider-controlled text into real document structure. Only a single
+    highlighter token is admitted: letters, digits, and the punctuation real
+    language names carry (``c++``, ``c#``, ``objective-c``, ``asp.net``,
+    ``shell_session``). Anything else drops to a bare fence, which costs syntax
+    highlighting and nothing else.
+    """
+    language = str(value or "")
+    return language if _MD_CODE_LANGUAGE_RE.match(language) else ""
+
+
+def _md_escape_block_leads(text: str) -> str:
+    """Escape a line-leading ``-``/``+``/``#``/``1.`` so it stays literal text.
+
+    The backslash goes before the punctuation, never before the digit: ``\\1`` is
+    not a valid CommonMark escape and would render as a visible backslash.
+    """
+
+    def _sub(match: re.Match[str]) -> str:
+        if match.group(2):
+            return f"{match.group(1)}\\{match.group(2)}"
+        return f"{match.group(1)}{match.group(3)}\\{match.group(4)}"
+
+    return _MD_BLOCK_LEAD_RE.sub(_sub, text)
+
+
+def _md_backtick_fence(text: str, minimum: int) -> str:
+    """A backtick fence long enough to survive the backticks inside *text*."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    return "`" * max(minimum, longest + 1)
+
+
+def _md_inline_code(text: str) -> str:
+    """Wrap *text* in an inline code span, unescaped (code spans are literal).
+
+    CommonMark cannot open a span whose content starts or ends with a backtick,
+    and it strips one leading and one trailing character from a span whose
+    content both begins and ends with a space or newline (unless the content is
+    nothing but whitespace, which is left alone). One space of padding -- which
+    that same rule then removes -- is what keeps such content intact.
+    """
+    fence = _md_backtick_fence(text, 1)
+    first, last = text[:1], text[-1:]
+    edge_stripped = first in (" ", "\n") and last in (" ", "\n") and text.strip() != ""
+    pad = " " if text.startswith("`") or text.endswith("`") or edge_stripped else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _md_link_target(url: str) -> str:
+    """Render *url* as a markdown link destination.
+
+    The bare form covers the common case; the angle-bracket form takes over when
+    the URL carries whitespace or parentheses, which would otherwise end the
+    destination early and spill the rest of the URL into the document.
+    """
+    if url and not re.search(r"[\s()<>]", url):
+        return url
+    inner = re.sub(r"\s+", "%20", url).replace("<", "%3C").replace(">", "%3E")
+    return f"<{inner}>"
+
+
+def _md_prefix_lines(text: str, prefix: str) -> str:
+    """Prefix every line of *text*, keeping blank lines inside the same block."""
+    stripped = prefix.rstrip()
+    return "\n".join(prefix + line if line else stripped for line in text.split("\n"))
+
+
+def _md_hang_indent(body: str, marker: str) -> str:
+    """Put *marker* on the first line and align continuation lines under it."""
+    if not body:
+        return ""
+    pad = " " * len(marker)
+    head, *rest = body.split("\n")
+    lines = [marker + head]
+    lines.extend(pad + line if line else "" for line in rest)
+    return "\n".join(lines)
+
+
+def _adf_to_markdown(node: Any, *, _depth: int = 0) -> str:
+    """Convert an Atlassian Document Format tree to markdown.
+
+    ADF is the JSON document model Jira Cloud v3 returns for rich-text fields
+    (descriptions and comment bodies). The panel renders those fields through
+    MarkdownRenderer, and every other provider puts real markdown in the same
+    payload field (a GitHub issue ``body``, a GitLab ``description``), so
+    emitting markdown here restores headings, lists, link URLs, code fences and
+    tables that a plain-text walk would drop.
+
+    Traversal is depth-limited (max 64 levels) to prevent stack exhaustion from a
+    malformed or maliciously deep document, and literal text is escaped so a
+    description cannot smuggle markup into the panel.
+
+    Best-effort by design: ADF tables may carry merged cells and nested blocks
+    that GFM cannot express (rendered as a flat approximation), and a ``media``
+    node without a public ``url`` attribute has no fetchable address, so it
+    contributes nothing.
+    """
+    if _depth > _ADF_MAX_DEPTH or not isinstance(node, dict):
+        return ""
+    if str(node.get("type") or "") in _ADF_BLOCK_TYPES:
+        return _adf_block_to_markdown(node, _depth=_depth)
+    return _adf_inline_to_markdown(node, _depth=_depth)
+
+
+def _adf_block_to_markdown(node: dict[str, Any], *, _depth: int) -> str:
+    """Render one ADF block node. Only called for a type in _ADF_BLOCK_TYPES."""
+    node_type = str(node.get("type") or "")
+    attrs = _as_dict(node.get("attrs"))
+    if node_type == "doc":
+        return _adf_join_blocks(node, _depth=_depth)
+    if node_type == "paragraph":
+        return _md_escape_block_leads(_adf_inline_run(node, _depth=_depth))
+    if node_type == "heading":
+        level = min(max(_int_or_zero(attrs.get("level")) or 1, 1), 6)
+        text = _adf_inline_run(node, _depth=_depth)
+        return f"{'#' * level} {text}" if text else ""
+    if node_type == "codeBlock":
+        body = _adf_raw_text(node, _depth=_depth)
+        fence = _md_backtick_fence(body, 3)
+        return f"{fence}{_md_code_language(attrs.get('language'))}\n{body}\n{fence}"
+    if node_type in ("blockquote", "panel"):
+        # An ADF panel (info/note/warning) has no markdown equivalent; a
+        # blockquote keeps it visually set apart from the surrounding prose.
+        inner = _adf_join_blocks(node, _depth=_depth)
+        return _md_prefix_lines(inner, "> ") if inner else ""
+    if node_type == "rule":
+        return "---"
+    if node_type in ("bulletList", "orderedList"):
+        return _adf_list_to_markdown(node, _depth=_depth, ordered=node_type == "orderedList")
+    if node_type == "taskList":
+        return _adf_task_list_to_markdown(node, _depth=_depth)
+    if node_type == "table":
+        return _adf_table_to_markdown(node, _depth=_depth)
+    # expand / nestedExpand: a collapsed section, whose title is the only part
+    # markdown cannot express as a container.
+    title = _adf_attr_label(attrs.get("title"))
+    inner = _adf_join_blocks(node, _depth=_depth)
+    return "\n\n".join(part for part in (f"**{title}**" if title else "", inner) if part)
+
+
+def _adf_inline_to_markdown(node: Any, *, _depth: int) -> str:
+    """Render one ADF inline node, recursing into an unrecognised container."""
+    if _depth > _ADF_MAX_DEPTH or not isinstance(node, dict):
+        return ""
+    node_type = str(node.get("type") or "")
+    attrs = _as_dict(node.get("attrs"))
+    if node_type == "text":
+        return _adf_apply_marks(str(node.get("text") or ""), _as_list(node.get("marks")))
+    if node_type == "hardBreak":
+        # Two trailing spaces: the panel renders with CommonMark soft-break
+        # collapse, so a bare newline would become a space.
+        return "  \n"
+    if node_type == "mention":
+        name = _adf_attr_label(attrs.get("text") or attrs.get("id"))
+        if not name:
+            return ""
+        return name if name.startswith("@") else f"@{name}"
+    if node_type == "emoji":
+        return _adf_attr_label(attrs.get("text") or attrs.get("shortName"))
+    if node_type == "inlineCard":
+        url = str(attrs.get("url") or "")
+        return f"[{_adf_attr_label(url)}]({_md_link_target(url)})" if url else ""
+    if node_type == "media":
+        # A link, not an image: the URL stays recoverable (the loss this fix is
+        # about) without the panel auto-fetching a provider-controlled address
+        # the moment someone opens the issue.
+        url = str(attrs.get("url") or "")
+        if not url:
+            return ""
+        return (
+            f"[{_adf_attr_label(attrs.get('alt')) or _adf_attr_label(url)}]({_md_link_target(url)})"
+        )
+    return "".join(
+        _adf_inline_to_markdown(child, _depth=_depth + 1) for child in _as_list(node.get("content"))
+    )
+
+
+def _adf_apply_marks(text: str, marks: list[dict[str, Any]]) -> str:
+    """Wrap literal *text* in the markdown for each ADF mark, innermost first.
+
+    A ``code`` mark is exclusive: a code span is literal by definition, so the
+    emphasis marks are not applied inside one and the text is not escaped.
+    Empty text takes no mark wrapping at all, since a bare ``****`` or ``` `` ```
+    would render as those literal characters rather than as nothing.
+    """
+    kinds = {str(mark.get("type") or "") for mark in marks}
+    if not text:
+        out = ""
+    elif "code" in kinds:
+        out = _md_inline_code(text)
+    else:
+        out = _md_escape_inline(text)
+        if "strong" in kinds:
+            out = f"**{out}**"
+        if "em" in kinds:
+            out = f"_{out}_"
+        if "strike" in kinds:
+            out = f"~~{out}~~"
+    for mark in marks:
+        if str(mark.get("type") or "") != "link":
+            continue
+        href = str(_as_dict(mark.get("attrs")).get("href") or "")
+        if href:
+            out = f"[{out or _md_escape_inline(href)}]({_md_link_target(href)})"
+        break
+    return out
+
+
+def _adf_inline_run(node: dict[str, Any], *, _depth: int) -> str:
+    """Concatenate a block's inline children into one line of markdown."""
+    return _adf_inline_sequence(_as_list(node.get("content")), _depth=_depth + 1).strip()
+
+
+def _adf_inline_sequence(children: list[dict[str, Any]], *, _depth: int) -> str:
+    """Render a run of inline nodes, keeping a split credential contiguous.
+
+    A plain-text walk joins sibling text nodes seamlessly, so the payload-level
+    ``_redact_provider_data`` pass sees one string and catches a credential that
+    spans two of them -- ``ghp_...`` in one node and its tail in a bold sibling.
+    Marks and escaping put delimiters between those halves, which would hide the
+    secret from that pass. So when a run's own raw text carries a credential, the
+    run is emitted as one redacted string and gives up its formatting: the run is
+    the exact span where a seamless walk and this converter disagree, which is
+    why the check lives here rather than over the whole document (a secret split
+    across two BLOCKS was never contiguous, in this converter or before it).
+    """
+    raw = "".join(_adf_raw_text(child, _depth=_depth) for child in children)
+    redacted = str(_redact_provider_data(raw))
+    if redacted != raw:
+        return _md_escape_inline(redacted)
+    return "".join(_adf_inline_to_markdown(child, _depth=_depth) for child in children)
+
+
+def _adf_raw_text(node: Any, *, _depth: int) -> str:
+    """Collect descendant text verbatim, for a code block's literal body."""
+    if _depth > _ADF_MAX_DEPTH or not isinstance(node, dict):
+        return ""
+    node_type = str(node.get("type") or "")
+    if node_type == "text":
+        return str(node.get("text") or "")
+    if node_type == "hardBreak":
+        return "\n"
+    return "".join(
+        _adf_raw_text(child, _depth=_depth + 1) for child in _as_list(node.get("content"))
+    )
+
+
+def _adf_join_blocks(node: dict[str, Any], *, _depth: int) -> str:
+    """Render a container's children as markdown blocks, blank-line separated."""
+    rendered = (
+        _adf_to_markdown(child, _depth=_depth + 1) for child in _as_list(node.get("content"))
+    )
+    return "\n\n".join(block for block in rendered if block)
+
+
+def _adf_item_body(item: dict[str, Any], *, _depth: int) -> str:
+    """Render one list item, which may mix inline text with nested blocks."""
+    blocks: list[tuple[str, bool]] = []
+    run: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        # Through _adf_inline_sequence, so an item's own inline children get the
+        # same split-credential guarantee a paragraph's do.
+        text = _adf_inline_sequence(list(run), _depth=_depth + 1).strip()
+        run.clear()
+        if text:
+            blocks.append((_md_escape_block_leads(text), False))
+
+    for child in _as_list(item.get("content")):
+        child_type = str(child.get("type") or "")
+        if child_type in _ADF_BLOCK_TYPES:
+            flush()
+            # Through _adf_to_markdown, never straight to the block renderer: a
+            # nested list would otherwise re-enter its own renderer past the
+            # depth cap and exhaust the stack on a deeply nested document.
+            rendered = _adf_to_markdown(child, _depth=_depth + 1)
+            if rendered:
+                blocks.append((rendered, child_type in _ADF_LIST_TYPES))
+        else:
+            run.append(child)
+    flush()
+
+    if not blocks:
+        return ""
+    parts = [blocks[0][0]]
+    for text, is_list in blocks[1:]:
+        parts.append("\n" if is_list else "\n\n")
+        parts.append(text)
+    return "".join(parts)
+
+
+def _adf_list_to_markdown(node: dict[str, Any], *, _depth: int, ordered: bool) -> str:
+    """Render a bullet or ordered list, honouring an explicit start number."""
+    start = _int_or_zero(_as_dict(node.get("attrs")).get("order")) or 1
+    lines: list[str] = []
+    for index, item in enumerate(_as_list(node.get("content"))):
+        marker = f"{start + index}. " if ordered else "- "
+        rendered = _md_hang_indent(_adf_item_body(item, _depth=_depth + 1), marker)
+        if rendered:
+            lines.append(rendered)
+    return "\n".join(lines)
+
+
+def _adf_task_list_to_markdown(node: dict[str, Any], *, _depth: int) -> str:
+    """Render an ADF task list as a GFM checklist."""
+    lines: list[str] = []
+    for item in _as_list(node.get("content")):
+        state = str(_as_dict(item.get("attrs")).get("state") or "").upper()
+        marker = "- [x] " if state == "DONE" else "- [ ] "
+        rendered = _md_hang_indent(_adf_item_body(item, _depth=_depth + 1), marker)
+        if rendered:
+            lines.append(rendered)
+    return "\n".join(lines)
+
+
+def _adf_table_to_markdown(node: dict[str, Any], *, _depth: int) -> str:
+    """Render an ADF table as a GFM table, using its first row as the header.
+
+    GFM requires a header row and cannot express merged cells or block content
+    inside a cell, so cell text is flattened to a single line and any
+    colspan/rowspan is ignored.
+
+    Each row emits its own cells and nothing more. GFM already inserts empty
+    cells for a row shorter than the header and ignores a longer row's excess,
+    so padding every row to the widest would only cost output: a table with one
+    very wide row and many narrow ones would emit rows x width cells for the
+    handful it actually carries, and a provider controls both numbers.
+    """
+    rows: list[list[str]] = []
+    for row in _as_list(node.get("content")):
+        if str(row.get("type") or "") != "tableRow":
+            continue
+        cells = [
+            _adf_cell_text(cell, _depth=_depth + 1)
+            for cell in _as_list(row.get("content"))
+            if str(cell.get("type") or "") in ("tableHeader", "tableCell")
+        ]
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return ""
+    header, *body = rows
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * len(header)) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    return "\n".join(lines)
+
+
+def _adf_cell_text(cell: dict[str, Any], *, _depth: int) -> str:
+    """Flatten one table cell to a single line (a GFM cell cannot wrap)."""
+    return re.sub(r"\s+", " ", _adf_join_blocks(cell, _depth=_depth)).strip()
 
 
 def _jira_linked_changes(fields: dict[str, Any], base_url: str) -> list[dict[str, Any]]:
@@ -3233,8 +3620,11 @@ async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
     # Extract description
     raw_desc = fields.get("description")
     if isinstance(raw_desc, dict):
-        # ADF (Cloud v3)
-        description = _adf_to_plain_text(raw_desc).strip()
+        # ADF (Cloud v3). The converter redacts internally, where it escapes:
+        # `_adf_inline_sequence` for a run's text and `_adf_attr_label` for an
+        # attribute. Both run inside its depth-capped traversal, so no unbounded
+        # pre-pass walks a provider-controlled tree.
+        description = _adf_to_markdown(raw_desc).strip()
     elif isinstance(raw_desc, str):
         # Plain text or wiki markup (Server v2)
         description = raw_desc
@@ -3302,7 +3692,7 @@ async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
         c_author = _as_dict(c.get("author"))
         c_body_raw = c.get("body")
         if isinstance(c_body_raw, dict):
-            c_body = _adf_to_plain_text(c_body_raw).strip()
+            c_body = _adf_to_markdown(c_body_raw).strip()
         elif isinstance(c_body_raw, str):
             c_body = c_body_raw
         else:
